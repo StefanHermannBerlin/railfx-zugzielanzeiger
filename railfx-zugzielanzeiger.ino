@@ -1,84 +1,86 @@
-#include <Wire.h>                             // Bibliothek für die I2C Funktionalität
-#include "SSD1306Ascii.h"                     // Bibliothek für die Displays
-#include "SSD1306AsciiWire.h"                 // Bibliothek für die Displays
-#include <dummy.h>                            // Bibliothek für ESP32
-#include <DBAPI.h>                            // Bibliothek um die Deutsche Bahn API abzufragen
+#include <WiFi.h>                             // WiFi-Funktionalität
+#include <Wire.h>                             // I2C-Funktionalität
+#include "SSD1306Ascii.h"                     // OLED-Display (Adafruit GFX)
+#include "SSD1306AsciiWire.h"                 // OLED-Display (I2C)
+#include <DBAPI.h>                            // Schnittstelle zur Deutschen Bahn API
 
 /*
-     Rail-FX Live-Zugzielanzeiger der Deutschen Bahn
-     StartHardware.org
+    Rail-FX Live-Zugzielanzeiger der Deutschen Bahn
+    StartHardware.org
 */
 
-/* ***** ***** Einstellungen ***** ***** ***** *****  ***** ***** ***** *****  ***** ***** ***** ***** */
+/* ***** Einstellungen ***** */
+const char* ssid            = "wifi-name";       // WiFi-Name
+const char* password        = "wifi-password";    // WiFi-Passwort
+const char* bahnhofsName    = "Berlin Hbf";   // Beispielstation (Liste z. B. unter https://data.deutschebahn.com/dataset/data-haltestellen.html)
+String removeString1        = "Berlin ";      // Zu entfernender String
+String removeString2        = "Berlin-";      // Zu entfernender String
+int showPlatform[8]         = {15, 16, 1, 2, 5, 6, 7, 8}; // Display-Gleis-Zuordnung
 
-const char* ssid = "wifi-name";                  // WiFi-Name
-const char* password = "wifi-password";           // WiFi-Passwort
-const char* bahnhofsName = "Berlin Hbf";      // Eine Liste findet man hier: https://data.deutschebahn.com/dataset/data-haltestellen.html
-String removeString1 = "Berlin ";             // Dieser String wird vom Bahnhofsnamen entfernt, z.B. "Berlin " von "Berlin Warschauer Straße"
-String removeString2 = "Berlin-";             // Dieser String wird vom Bahnhofsnamen entfernt, z.B. "Berlin-" von "Berlin-Westkreuz"
-int showPlatform[8] = {15, 16, 1, 2, 5, 6, 7, 8};  // Zuordnung der Displays zu den Gleisen (Display 1 = Gleis 15, Display 2 = Gleis 16 ... Display 8 = Gleis 8
+long anzeigeTimeout         = 10000;          // Anzeigewechselintervall (ms)
+int apiCallTimeout          = 20000;          // Pause zwischen API-Abfragen (ms)
+int maxPlatforms            = 20;
 
-long anzeigeTimeout = 20000;                  // Anzeigewechsel alle x Millisekunden
-int apiCallTimeout = 20000;                   // Pause in Millisekunden zwischen den API Calls der DB API – Abrufen der Abfahrtszeiten alle x Millisekunden
+/* ***** Globale Objekte und Variablen ***** */
+DBAPI db;                                      // DB API Objekt
+#define I2C_ADDRESS 0x3C                       // OLED I2C Adresse
 
-int maxPlatforms = 20;
+String theDates[250];       // Datum-Strings (Format: TT.MM.JJJJ)
+String theTimes[250];       // Uhrzeit-Strings (Format: HH:MM)
+String theProducts[250];    // Zugtyp (z. B. ICE)
+String theTargets[250];     // Zielhaltestelle
+String thePlatforms[250];   // Gleisnummer als String
+String theTextdelays[250];  // Verspätung als Text
+int myIndex = 0;            // Anzahl der erfassten Einträge
 
-/* ***** ***** Ab hier beginnt der Programmcode, der nicht oder wenig angepasst werden muss ***** ***** ***** ***** */
+const char* ntpServer       = "pool.ntp.org"; // NTP-Server
+const long  gmtOffset_sec   = 3600;           // Zeitzonenoffset (CET)
+const int   daylightOffset_sec = 0;           // Sommerzeit-Offset
 
-DBAPI db;                                      // Bahn API Objekt
-#define I2C_ADDRESS 0x3C                       // Adresse der OLEDs
+// Aktuelle Zeitvariablen
+int myDay, myMonth, myYear, myHour, myMinute;
 
-/* Speicher Variablen */
-char* theDates[250];                           // Array, um Abfahrtsdaten zu speichern
-char* theTimes[250];                           // Array, um Abfahrtsdaten zu speichern
-char* theProducts[250];                        // Array, um Abfahrtsdaten zu speichern
-String theTargets[250];                        // Array, um Abfahrtsdaten zu speichern
-String thePlatforms[250];                      // Array, um Abfahrtsdaten zu speichern
-char* theTextdelays[250];                      // Array, um Abfahrtsdaten zu speichern
-int myIndex = 0;                               // Anzahl der Einträge im Array
-
-const char* ntpServer = "pool.ntp.org";        // Network Time Protokol Server-Adresse
-const long  gmtOffset_sec = 3600;             // Offset für Zeitzone (3600 = CET)
-const int   daylightOffset_sec = 3600;        // Offset für Sommerzeit (3600 = Sommerzeit)
-
-
-int myDay;                                    // Aktueller Tag
-int myMonth;                                  // Aktueller Monat
-int myYear;                                   // Aktuelles Jahr
-int myHour;                                   // Aktuelle Stunde
-int myMinute;                                 // Aktuelle Minute
-
-/* Timer Variablen */
+// Timer Variablen
 long anzeigeTimer = 0;
-long apiCallTime;
+long apiCallTime  = 0;
 
-/* Variablen für das OLED */
+// OLED Objekt
 SSD1306AsciiWire oled;
 
+/* Funktionsprototypen */
+void TCA9548A(uint8_t bus);
+void drawTest(uint8_t displayNr);
+void drawInfo(uint8_t displayNr, int platformToDisplay);
+void anzeigeTafel();
+void getLocalTime();
+int theTimeDifference(String theDepartureTime, String theDepartureDate);
+void callDBApi();
+
 void setup() {
-  Wire.begin();                              // I2C Verbindung zum OLED
-  Wire.setClock(400000L);                    // I2C Verbindung zum OLED
-  for (int i = 0; i < 7; i++) {
+  Wire.begin();
+  Wire.setClock(400000L);
+  
+  // Initialisiere alle 8 Displays (falls alle angeschlossen sind)
+  for (int i = 0; i < 8; i++) {
     TCA9548A(i);
-    oled.begin(&Adafruit128x32, I2C_ADDRESS);  // Start des OLEDs
+    oled.begin(&Adafruit128x32, I2C_ADDRESS);
   }
 
-  Serial.begin(115200);                      // started die serielle Kommunikation
-  WiFi.mode(WIFI_STA);                       // Setzt den WIFI-Modus
-  WiFi.begin(ssid, password);                // Startet die WIFI Verbindung
+  Serial.begin(115200);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) {
     Serial.write('.');
     delay(500);
   }
 
-  drawTest(0);   // Tafel an I2C Adresse 0 des TCA9548A, Test
-  drawTest(1);   // Tafel an I2C Adresse 0 des TCA9548A, Test
-  drawTest(2);   // Tafel an I2C Adresse 0 des TCA9548A, Test
-  drawTest(3);   // Tafel an I2C Adresse 0 des TCA9548A, Test
+  // Führe einen kurzen Test auf einigen Displays durch
+  for (int i = 0; i < 4; i++) {
+    drawTest(i);
+  }
 
-  DBstation* station = db.getStation(bahnhofsName); // Setzt den Bahnhof für die DB Api
-
-  //yield();
+  // Abfrage der Bahnhofsdaten
+  DBstation* station = db.getStation(bahnhofsName);
   if (station != NULL) {
     Serial.println();
     Serial.print("Name:      ");
@@ -90,152 +92,194 @@ void setup() {
     Serial.print("Longitude: ");
     Serial.println(station->longitude);
   }
+  
   callDBApi();
-  anzeigeTimer -= anzeigeTimeout;
+  anzeigeTimer = millis() - anzeigeTimeout; // sofortige erste Aktualisierung der Anzeige
 }
 
 void loop() {
-  //yield();
   if (apiCallTime + apiCallTimeout < millis()) {
     configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
     getLocalTime();
-    //delay(100);
     callDBApi();
     apiCallTime = millis();
   }
-
   anzeigeTafel();
 }
 
+/* ===== Anzeige-Funktionen ===== */
 void anzeigeTafel() {
-  if (anzeigeTimer + anzeigeTimeout < millis()) { // der zweite Teil verhindert, dass ein Anzeigewechsel dem Empfang des Zeitsignals blockiert
+  if (anzeigeTimer + anzeigeTimeout < millis()) {
     anzeigeTimer = millis();
+    // Aktualisiere alle 8 Displays (Index 0 bis 7)
     for (int i = 0; i < 8; i++) {
-      drawInfo(i, showPlatform[i]); // Tafeln an I2C Adressen 0 - 7 des TCA9548A
+      drawInfo(i, showPlatform[i]);
     }
   }
 }
 
-void drawInfo(uint8_t displayNr, int platformToDisplay) {     // OLED Ausgabe
-  Serial.println("Draw: "); Serial.println(displayNr);
+void drawInfo(uint8_t displayNr, int platformToDisplay) {
+  Serial.print("Draw: ");
+  Serial.println(displayNr);
   TCA9548A(displayNr);
-  int theEntryIndexes[] = {-1,-1,-1,-1};
-  int theEntryIndexesIndex = 0;
-
-  for (int j = 0; j < myIndex; j++) {
-    if (theEntryIndexesIndex < 4) {
-      if (thePlatforms[j].toInt() == platformToDisplay) {
-        theEntryIndexes[theEntryIndexesIndex] = j;
-        Serial.print(displayNr); Serial.print(" <- Display \t ");Serial.print(j); Serial.print(" <- Index \t ");Serial.println(thePlatforms[j].toInt());
-        theEntryIndexesIndex++;
-      }
+  
+  // Ermittle bis zu 4 Einträge, die diesem Gleis zugeordnet sind
+  int theEntryIndexes[4] = {-1, -1, -1, -1};
+  int idx = 0;
+  for (int j = 0; j < myIndex && idx < 4; j++) {
+    if (thePlatforms[j].toInt() == platformToDisplay) {
+      theEntryIndexes[idx++] = j;
+      Serial.print(displayNr);
+      Serial.print(" <- Display \t ");
+      Serial.print(j);
+      Serial.print(" <- Index \t ");
+      Serial.println(thePlatforms[j].toInt());
     }
   }
 
   oled.clear();
-  //oled.setInvertMode(0);
   oled.setFont(Adafruit5x7);
   for (int i = 0; i < 4; i++) {
     if (theEntryIndexes[i] != -1) {
-      oled.setCursor(0 , i); oled.println(theTimeDifference(theTimes[theEntryIndexes[i]], theDates[theEntryIndexes[i]]));
-      oled.setCursor(20 , i); oled.println(theTargets[theEntryIndexes[i]]);
-
+      oled.setCursor(0, i);
+      oled.println(theTimeDifference(theTimes[theEntryIndexes[i]], theDates[theEntryIndexes[i]]));
+      oled.setCursor(20, i);
+      oled.println(theTargets[theEntryIndexes[i]]);
     }
   }
   delay(100);
 }
 
-void drawTest(uint8_t displayNr) {     // OLED Ausgabe
-  Serial.println("DrawTest: "); Serial.println(displayNr);
+void drawTest(uint8_t displayNr) {
+  Serial.print("DrawTest: ");
+  Serial.println(displayNr);
   TCA9548A(displayNr);
   oled.clear();
-  //oled.setInvertMode(0);
   oled.setFont(Adafruit5x7);
-  oled.setCursor(0 , 0); oled.println("RailFX");
-  oled.setCursor(0 , 1); oled.println("RailFX");
-  oled.setCursor(0 , 2); oled.println("RailFX");
-  oled.setCursor(0 , 3); oled.println("RailFX");
-  oled.setCursor(30 , 0); oled.println("StartHardware");
-  oled.setCursor(30 , 1); oled.println("StartHardware");
-  oled.setCursor(30 , 2); oled.println("StartHardware");
-  oled.setCursor(30 , 3); oled.println("StartHardware");
+  // Zeige Test-Text an
+  oled.setCursor(0, 0); oled.println("RailFX");
+  oled.setCursor(0, 1); oled.println("RailFX");
+  oled.setCursor(0, 2); oled.println("RailFX");
+  oled.setCursor(0, 3); oled.println("RailFX");
+  oled.setCursor(30, 0); oled.println("StartHardware");
+  oled.setCursor(30, 1); oled.println("StartHardware");
+  oled.setCursor(30, 2); oled.println("StartHardware");
+  oled.setCursor(30, 3); oled.println("StartHardware");
 }
 
+/* ===== I2C-Multiplexer ===== */
 void TCA9548A(uint8_t bus) {
-  if (bus > 7) return;           // Falls Input zu groß, abbrechen
-  Wire.beginTransmission(0x70);  // TCA9548A address is 0x70
-  Wire.write(1 << bus);          // send byte to select bus
+  if (bus > 7) return;
+  Wire.beginTransmission(0x70);
+  Wire.write(1 << bus);
   Wire.endTransmission();
 }
 
-void getLocalTime() {                         // Aktuelle Zeit abfragen
-  time_t now = time(NULL);
-  struct tm *tm_struct = localtime(&now);
-  myDay = tm_struct->tm_mday;
-  myMonth = tm_struct->tm_mon + 1;
-  myYear = tm_struct->tm_year + 1900;
-  myHour = tm_struct->tm_hour;
+/* ===== Zeitfunktionen ===== */
+void getLocalTime() {
+  time_t nowTime = time(nullptr);
+  struct tm *tm_struct = localtime(&nowTime);
+  myDay    = tm_struct->tm_mday;
+  myMonth  = tm_struct->tm_mon + 1;
+  myYear   = tm_struct->tm_year + 1900;
+  myHour   = tm_struct->tm_hour;
   myMinute = tm_struct->tm_min;
 }
 
-int theTimeDifference(char* theDepartureTime, char* theDepartureDate) {
-  int timeToTrain = 0;
+// Gibt die Differenz in Minuten zwischen Abfahrtszeit und aktueller Zeit zurück
+int theTimeDifference(String theDepartureTime, String theDepartureDate) {
+  int depHour, depMinute, depDay, depMonth, depYear;
+  // Lese Abfahrtszeit und Datum aus den Strings
+  sscanf(theDepartureTime.c_str(), "%d:%d", &depHour, &depMinute);
+  sscanf(theDepartureDate.c_str(), "%d.%d.%d", &depDay, &depMonth, &depYear);
 
-  int theDepartureHour, theDepartureMinute;
-  sscanf(theDepartureTime, "%d:%d", &theDepartureHour, &theDepartureMinute);
-  int theDepartureYear, theDepartureMonth, theDepartureDay;
-  sscanf(theDepartureDate, "%d.%d.%d", &theDepartureDay, &theDepartureMonth, &theDepartureYear);
+  // Debug-Ausgaben für die Eingangsdaten und die geparsten Werte
+  Serial.print("DEBUG: theDepartureTime = ");
+  Serial.println(theDepartureTime);
+  Serial.print("DEBUG: theDepartureDate = ");
+  Serial.println(theDepartureDate);
+  Serial.print("DEBUG: Parsed departure time = ");
+  Serial.print(depHour);
+  Serial.print(":");
+  Serial.println(depMinute);
+  Serial.print("DEBUG: Parsed departure date = ");
+  Serial.print(depDay);
+  Serial.print(".");
+  Serial.print(depMonth);
+  Serial.print(".");
+  Serial.println(depYear);
 
-  boolean departureTomorrow = false;
-  if (theDepartureYear - 2000 > myYear) {
-    departureTomorrow = true;
-  } else if (theDepartureMonth > myMonth) {
-    departureTomorrow = true;
-  } else if (theDepartureDay > myDay) {
-    departureTomorrow = true;
+  // Bestimme, ob die Abfahrt morgen ist
+  bool departureTomorrow = (depYear > myYear) ||
+                           (depYear == myYear && depMonth > myMonth) ||
+                           (depYear == myYear && depMonth == myMonth && depDay > myDay);
+
+  // Berechne die aktuelle Zeit in Minuten
+  int currentMinutes = myHour * 60 + myMinute;
+  // Berechne die Abfahrtszeit in Minuten
+  int departureMinutes = depHour * 60 + depMinute;
+
+  if (departureTomorrow) {
+    Serial.println("DEBUG: Departure is tomorrow, adding 24*60 minutes");
+    departureMinutes += 24 * 60;
   }
 
-  if (departureTomorrow == true) {
-    timeToTrain = ((theDepartureHour + 24) * 60 + theDepartureMinute) - (myHour * 60 + myMinute);
-  } else {
-    timeToTrain = (theDepartureHour * 60 + theDepartureMinute) - (myHour * 60 + myMinute);
-  }
-  return timeToTrain;
+  int diff = departureMinutes - currentMinutes;
+  Serial.print("DEBUG: Final departureMinutes = ");
+  Serial.println(departureMinutes);
+  Serial.print("DEBUG: Time difference = ");
+  Serial.println(diff);
+
+  return diff;
 }
 
+/* ===== API-Aufruf ===== */
 void callDBApi() {
   Serial.println("Call DB API");
   DBstation* station = db.getStation(bahnhofsName);
   myIndex = 0;
-  DBdeparr* da = db.getDepartures(station->stationId, NULL, NULL, NULL, 0, PROD_ICE | PROD_IC_EC | PROD_IR | PROD_RE | PROD_S);
-  char myDate;
-  while (da != NULL) {
+  // Abrufen der Abfahrtsdaten (mit 40 Ergebnissen, 1 Stunde Dauer, gewünschte Verkehrsmittel)
+  DBdeparr* da = db.getDepartures(station->stationId, NULL, NULL, 20, 1,
+                                    PROD_ICE | PROD_IC_EC | PROD_IR | PROD_RE | PROD_S);
+  
+  while (da != NULL && myIndex < 250) {
     yield();
-    theDates[myIndex] = da->date;
-    theTimes[myIndex] = da->time;
-    theProducts[myIndex] = da->product;
-    theTargets[myIndex] = da->target;
-    thePlatforms[myIndex] = da->platform;
-    theTextdelays[myIndex] = da->textdelay;
+    
+    // Konvertiere den time_t-Wert in Datum und Uhrzeit als String
+    char dateBuffer[20];
+    char timeBuffer[10];
+    //struct tm *tm_info = localtime(&da->time);
+    struct tm *tm_info = gmtime(&da->time);
+    strftime(dateBuffer, sizeof(dateBuffer), "%d.%m.%Y", tm_info);
+    strftime(timeBuffer, sizeof(timeBuffer), "%H:%M", tm_info);
+
+    theDates[myIndex]    = String(dateBuffer);
+    theTimes[myIndex]    = String(timeBuffer);
+    theProducts[myIndex] = String(da->product);
+    theTargets[myIndex]  = String(da->target);
+    thePlatforms[myIndex]= String(da->platform);
+    theTextdelays[myIndex] = String(da->delay)+ " min";
+    
     da = da->next;
     myIndex++;
   }
 
+  // Ausgabe der abgerufenen Daten über Serial
   for (int platform = 0; platform < maxPlatforms; platform++) {
     for (int i = 0; i < myIndex; i++) {
-      if ( thePlatforms[i].toInt() == platform) {
-        //Serial.print(theDates[i]); Serial.print("\t");
+      if (thePlatforms[i].toInt() == platform) {
         Serial.print(i); Serial.print("\t");
         Serial.print(theTimes[i]); Serial.print("\t");
         Serial.print(theProducts[i]); Serial.print("\t");
         Serial.print(thePlatforms[i]); Serial.print("\t");
         Serial.print(theTextdelays[i]); Serial.print("\t");
-        theTargets[i].replace(removeString1, "");
-        theTargets[i].replace(removeString2, "");
-        Serial.print(theTargets[i]); Serial.println("");
+        // Entferne überflüssige Zeichen aus dem Zielnamen
+        String targetClean = theTargets[i];
+        targetClean.replace(removeString1, "");
+        targetClean.replace(removeString2, "");
+        Serial.println(targetClean);
       }
     }
   }
-  Serial.println(""); Serial.println("");
-  Serial.println("");
+  Serial.println("\n\n");
 }
